@@ -15,9 +15,9 @@ the RL loop for **Experiment 3**:
 
 - New neural appraisal model in `models/neural_appraisal.py` (PyTorch).
 - Extended Q-learning agent in `Exp3/02_mdp_model/agent.py` with:
-	- Optional **neural appraisal** (vs. rule-based).
-	- Optional **emotion-based reward shaping**.
-	- Episode-level logging of emotion and cumulative reward.
+  - Optional **neural appraisal** (vs. rule-based).
+  - Optional **emotion-based reward shaping**.
+  - Episode-level logging of emotion and cumulative reward.
 
 You can run the original pipeline (baseline) or the extended neural version
 by toggling flags in `Exp3/02_mdp_model/agent.py`.

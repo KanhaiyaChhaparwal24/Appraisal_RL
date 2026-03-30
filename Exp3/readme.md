@@ -36,7 +36,7 @@ using Scherer's table. Outputs:
 Run `01_classifier/03_determine_classifier_c.py` to determine optimal C values
 for free and limit classifiers (matching human behavior):
 
-- Human Free (loose classifier): c = 0.0032, variance = 0.0002  
+- Human Free (loose classifier): c = 0.0032, variance = 0.0002
 - Human Limit (restricted classifier): c = 0.014, variance = 0.0056
 
 ### 1.2 MDP Model Execution
@@ -64,19 +64,18 @@ Generate plots for Figures 6 and 7 by running:
 
 ## 2. Extended Pipeline: Neural Appraisal + Emotion-Based Reward
 
-
 This fork extends the original Experiment 3 with a learnable appraisal model
 and a reward function that depends on emotion.
 
 ### 2.1 Neural Appraisal Model
 
-- File: `models/neural_appraisal.py`  
+- File: `models/neural_appraisal.py`
 - Class: `NeuralAppraisal(nn.Module)` (PyTorch)
-	- Input: state vector (currently a one-hot encoding over permitted MDP
-		states).
-	- Architecture: `Linear → ReLU → Linear → ReLU → Linear`.
-	- Output: 4D emotion/appraisal vector:  
-		`[suddenness, goal_relevance, conduciveness, power]`.
+  - Input: state vector (currently a one-hot encoding over permitted MDP
+    states).
+  - Architecture: `Linear → ReLU → Linear → ReLU → Linear`.
+  - Output: 4D emotion/appraisal vector:  
+    `[suddenness, goal_relevance, conduciveness, power]`.
 
 The model is integrated into the Q-learning agent but kept optional via
 feature flags.
@@ -88,16 +87,16 @@ feature flags.
 The `agent` class now exposes a unified appraisal interface:
 
 - Rule-based appraisal methods (original):
-	- `appraise_suddenness()`
-	- `appraise_goal_relevance()`
-	- `appraise_conduciveness()`
-	- `appraise_power()`
+  - `appraise_suddenness()`
+  - `appraise_goal_relevance()`
+  - `appraise_conduciveness()`
+  - `appraise_power()`
 - Unified accessor: `compute_emotion(...)`  
-	Returns a 4D emotion vector and updates:
-	- `self.sud_app`
-	- `self.goal_app`
-	- `self.cdc_app`
-	- `self.power_app`
+  Returns a 4D emotion vector and updates:
+  - `self.sud_app`
+  - `self.goal_app`
+  - `self.cdc_app`
+  - `self.power_app`
 
 When neural appraisal is enabled, `compute_emotion` can route through the
 `NeuralAppraisal` network.
@@ -107,10 +106,10 @@ When neural appraisal is enabled, `compute_emotion` can route through the
 In `agent.py`, reward can be driven by emotion as follows:
 
 - Base reward is computed by each MDP (e.g. `anxiety.py`, `despair.py`,
-	`irritation.py`, `rage.py`) via `mdp.calculate_reward()`.
+  `irritation.py`, `rage.py`) via `mdp.calculate_reward()`.
 - The agent can optionally:
-	- Replace this reward with an emotion-based signal, or
-	- Mix both into a combined reward.
+  - Replace this reward with an emotion-based signal, or
+  - Mix both into a combined reward.
 
 Configuration flags (in `agent.py`):
 
@@ -146,7 +145,7 @@ The agent logs:
 - Q-values and TD-errors at key points.
 - Episode-level cumulative reward.
 - Final or current emotion vector `[suddenness, goal_relevance,
-	conduciveness, power]`.
+conduciveness, power]`.
 
 This makes it easier to track how changes in appraisal impact learning.
 
@@ -202,23 +201,23 @@ learning dynamics.
 Planned and possible extensions include:
 
 - **Richer inputs to neural appraisal**  
-	Move from purely state-based input to `[state, TD-error, Q-values]` so that
-	emotion becomes explicitly learning-aware.
+  Move from purely state-based input to `[state, TD-error, Q-values]` so that
+  emotion becomes explicitly learning-aware.
 
 - **Temporal / sequence modeling**  
-	Extend `NeuralAppraisal` with an LSTM or GRU to handle sequences of states
-	and appraisals: `emotion_t = f(state_t, hidden_state_{t-1})`.
+  Extend `NeuralAppraisal` with an LSTM or GRU to handle sequences of states
+  and appraisals: `emotion_t = f(state_t, hidden_state_{t-1})`.
 
 - **Joint RL + appraisal training**  
-	Instead of pure imitation of the rule-based appraisals, combine RL
-	objectives with a small regularization term encouraging consistency with the
-	original model.
+  Instead of pure imitation of the rule-based appraisals, combine RL
+  objectives with a small regularization term encouraging consistency with the
+  original model.
 
 - **Systematic comparisons**  
-	Quantitatively compare behavior under:
-	- Rule-based vs neural appraisal.
-	- State-based vs emotion-based reward.
-	- Different emotion→reward mappings.
+  Quantitatively compare behavior under:
+  - Rule-based vs neural appraisal.
+  - State-based vs emotion-based reward.
+  - Different emotion→reward mappings.
 
 These directions aim to turn the neural appraisal module from a function
 approximator of existing rules into a component that **learns useful emotional
