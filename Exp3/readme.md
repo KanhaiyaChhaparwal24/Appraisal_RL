@@ -4,7 +4,8 @@ This folder contains the code for Experiment 3, where an agent learns via
 reinforcement learning in several emotion-eliciting scenarios (anxiety,
 despair, irritation, rage). Originally, appraisal was computed by
 hand-crafted, rule-based functions; this fork extends the setup with a
-**neural appraisal model** and **emotion-based reward**.
+**modular appraisal layer**, a **neural appraisal model**, and
+**emotion-based reward shaping**.
 
 ---
 
@@ -62,137 +63,145 @@ Generate plots for Figures 6 and 7 by running:
 
 ---
 
-## 2. Extended Pipeline: Neural Appraisal + Emotion-Based Reward
+## 2. Extended Pipeline: Modular / Neural Appraisal + Emotion-Based Reward
 
-This fork extends the original Experiment 3 with a learnable appraisal model
-and a reward function that depends on emotion.
+This fork extends the original Experiment 3 with a modular appraisal layer, a
+learnable appraisal model, and a reward function that depends on emotion via
+reward shaping.
 
-### 2.1 Neural Appraisal Model
+### 2.1 Appraisal Models
 
-- File: `models/neural_appraisal.py`
-- Class: `NeuralAppraisal(nn.Module)` (PyTorch)
-  - Input: state vector (currently a one-hot encoding over permitted MDP
-    states).
-  - Architecture: `Linear → ReLU → Linear → ReLU → Linear`.
-  - Output: 4D emotion/appraisal vector:  
-    `[suddenness, goal_relevance, conduciveness, power]`.
+Appraisal logic is encapsulated in
+[02_mdp_model/appraisal_model.py](02_mdp_model/appraisal_model.py):
 
-The model is integrated into the Q-learning agent but kept optional via
-feature flags.
+- `RuleBasedAppraisalModel` wraps the original appraisal functions from the
+  agent (suddenness, goal relevance, conduciveness, power) and exposes a
+  single `compute(...)` method that returns a 4D vector
+  `[suddenness, goal_relevance, conduciveness, power]`.
+- `NeuralAppraisalModel` uses the PyTorch network defined in
+  [../models/neural_appraisal.py](../models/neural_appraisal.py). Instead of
+  raw state, it consumes **learning-aware features** such as TD-error,
+  immediate reward, max \(Q(s', \cdot)\), and \(Q(s,a)\), then outputs the
+  same 4D appraisal vector (sigmoid-bounded to [0, 1]).
+
+Both models share the same interface so the agent can seamlessly switch
+between rule-based and neural appraisal.
 
 ### 2.2 Agent and Appraisal Interface
 
-- File: `02_mdp_model/agent.py`
+- File: [02_mdp_model/agent.py](02_mdp_model/agent.py)
 
-The `agent` class now exposes a unified appraisal interface:
+The `agent` class now uses the appraisal models above and exposes a unified
+`compute_emotion(...)` method that:
 
-- Rule-based appraisal methods (original):
-  - `appraise_suddenness()`
-  - `appraise_goal_relevance()`
-  - `appraise_conduciveness()`
-  - `appraise_power()`
-- Unified accessor: `compute_emotion(...)`  
-  Returns a 4D emotion vector and updates:
-  - `self.sud_app`
-  - `self.goal_app`
-  - `self.cdc_app`
-  - `self.power_app`
+- Calls `RuleBasedAppraisalModel` by default.
+- Optionally calls `NeuralAppraisalModel` when neural appraisal is enabled.
+- Updates internal fields
+  `self.sud_app`, `self.goal_app`, `self.cdc_app`, `self.power_app`.
 
-When neural appraisal is enabled, `compute_emotion` can route through the
-`NeuralAppraisal` network.
+This isolates appraisal logic from the rest of the RL implementation.
 
-### 2.3 Emotion-Based Reward
+### 2.3 Emotion-Based Reward Shaping
 
-In `agent.py`, reward can be driven by emotion as follows:
+In the extended agent, reward can depend on emotion via **shaping**:
 
-- Base reward is computed by each MDP (e.g. `anxiety.py`, `despair.py`,
-  `irritation.py`, `rage.py`) via `mdp.calculate_reward()`.
-- The agent can optionally:
-  - Replace this reward with an emotion-based signal, or
-  - Mix both into a combined reward.
+- Base reward \(r\) is computed by each MDP (e.g.
+  [02_mdp_model/anxiety.py](02_mdp_model/anxiety.py),
+  [02_mdp_model/despair.py](02_mdp_model/despair.py),
+  [02_mdp_model/irritation.py](02_mdp_model/irritation.py),
+  [02_mdp_model/rage.py](02_mdp_model/rage.py)) via `mdp.calculate_reward()`.
+- Appraisal produces a 4D vector
+  \( e = [suddenness, goal, conduciveness, power] \).
+- A scalar emotion term \(f(e)\) is computed (linear combination of these
+  components), and the shaped reward is:
 
-Configuration flags (in `agent.py`):
+$$
+r' = r + \lambda f(e)
+$$
 
-```python
-USE_NEURAL_APPRAISAL = False      # rule-based vs neural appraisal
+where \(\lambda\) is a tunable scalar. This keeps the original reward
+signal while allowing emotion to influence learning.
 
-USE_EMOTION_REWARD = False        # state-based vs emotion-based reward
-EMOTION_REWARD_MODE = "replace"   # "replace" or "mix"
-EMOTION_REWARD_BASE_WEIGHT = 0.5  # weight for base reward when mix is used
-```
+Shaping and appraisal mode are controlled by environment variables (read in
+`agent.py`):
 
-Reward mapping from emotion to scalar (simplified example):
+- `USE_NEURAL_APPRAISAL` – `0` for rule-based appraisal, `1` for neural.
+- `USE_EMOTION_REWARD` – `0` for plain reward, `1` to enable shaping.
+- `EMOTION_REWARD_LAMBDA` – scalar \(\lambda\) multiplying the emotion term.
 
-```python
-# emotion = [suddenness, goal_relevance, conduciveness, power]
-reward = 1.0 * goal_relevance \
-			 + 1.0 * conduciveness \
-			 - 0.5 * suddenness \
-			 + 0.5 * power
-```
-
-This connects the appraisal signal directly to the RL update, enabling
-comparisons between:
+This enables comparisons between:
 
 1. Original state-based reward (baseline).
-2. Emotion-based reward using rule-based appraisal.
-3. Emotion-based reward using neural appraisal.
+2. Emotion-shaped reward using rule-based appraisal.
+3. Emotion-shaped reward using neural appraisal.
 
 ### 2.4 Logging and Debugging
 
-The agent logs:
+When `LOG_STEPS=1`, the agent writes detailed per-step logs to
+[logs](logs):
 
-- Q-values and TD-errors at key points.
-- Episode-level cumulative reward.
-- Final or current emotion vector `[suddenness, goal_relevance,
-conduciveness, power]`.
+- States, actions, rewards, TD-errors.
+- Q-values (per state-action) serialized to JSON.
+- Appraisal components `[suddenness, goal_relevance, conduciveness, power]`.
 
-This makes it easier to track how changes in appraisal impact learning.
+This makes it easier to track how changes in appraisal and reward shaping
+impact learning dynamics.
 
 ---
 
-## 3. How to Run Baseline vs. Neural Variants
+## 3. How to Run Baseline vs. Extended Variants
 
-All commands below are from the `Exp3` directory.
+All commands below assume you start from the [Exp3](.) directory.
 
-### 3.1 Baseline: Rule-Based Appraisal + State-Based Reward
+### 3.1 Recommended: Automated Experiments
 
-In `02_mdp_model/agent.py`:
-
-```python
-USE_NEURAL_APPRAISAL = False
-USE_EMOTION_REWARD = False
-```
-
-Then run, for example, the anxiety scenario:
+To run all four scenarios (anxiety, despair, irritation, rage) plus SVM
+inference for both **baseline** and **emotion-shaped** modes, and save
+results into timestamped folders under [results](results):
 
 ```bash
+cd Exp3
+python run_experiments.py
+```
+
+This will:
+
+- Run each scenario once in **baseline** mode
+  (`USE_NEURAL_APPRAISAL=0`, `USE_EMOTION_REWARD=0`).
+- Run each scenario once in **emotion-shaped** mode
+  (`USE_NEURAL_APPRAISAL=0`, `USE_EMOTION_REWARD=1`, with a default
+  `EMOTION_REWARD_LAMBDA`).
+- Call [03_model_infer/01_svm_infer.py](03_model_infer/01_svm_infer.py) in
+  each mode.
+- Save snapshots of `model_result.csv` and all `svm_*.csv` files into
+  [results](results) with mode- and time-stamped subfolders.
+
+### 3.2 Manual Runs: Baseline vs Emotion-Shaped
+
+You can also run individual scenarios while explicitly setting environment
+variables. Conceptually:
+
+- **Baseline (rule-based appraisal, no shaping):**
+  - `USE_NEURAL_APPRAISAL=0`, `USE_EMOTION_REWARD=0`.
+- **Emotion-shaped (rule-based appraisal):**
+  - `USE_NEURAL_APPRAISAL=0`, `USE_EMOTION_REWARD=1`,
+    `EMOTION_REWARD_LAMBDA` set to your chosen value (e.g. `0.5`).
+- **Emotion-shaped (neural appraisal):**
+  - `USE_NEURAL_APPRAISAL=1`, `USE_EMOTION_REWARD=1`,
+    `EMOTION_REWARD_LAMBDA` set as above.
+
+On Windows PowerShell, for example, you can do:
+
+```powershell
+cd Exp3
+$env:USE_NEURAL_APPRAISAL = "0"
+$env:USE_EMOTION_REWARD   = "0"
+$env:LOG_STEPS            = "0"   # or "1" for detailed logs
 python 02_mdp_model/anxiety.py
 ```
 
-### 3.2 Emotion-Based Reward (Rule-Based Appraisal)
-
-```python
-USE_NEURAL_APPRAISAL = False
-USE_EMOTION_REWARD = True
-EMOTION_REWARD_MODE = "replace"  # or "mix"
-```
-
-Run a scenario as before and observe differences in cumulative reward and
-policy.
-
-### 3.3 Emotion-Based Reward (Neural Appraisal)
-
-After installing PyTorch (see `Exp3/requirements.txt`):
-
-```python
-USE_NEURAL_APPRAISAL = True
-USE_EMOTION_REWARD = True
-```
-
-Now the reward signal depends on the neural appraisal output. Changing the
-neural network (architecture, training regime) should lead to different
-learning dynamics.
+Adjust the environment variables and script name to explore different
+configurations and scenarios.
 
 ---
 
@@ -200,13 +209,14 @@ learning dynamics.
 
 Planned and possible extensions include:
 
-- **Richer inputs to neural appraisal**  
-  Move from purely state-based input to `[state, TD-error, Q-values]` so that
-  emotion becomes explicitly learning-aware.
+-- **Richer inputs to neural appraisal (in progress)**  
+ The current neural appraisal already uses learning-aware features
+(including TD-error and Q-values). Further extensions could add more
+temporal information or history.
 
-- **Temporal / sequence modeling**  
-  Extend `NeuralAppraisal` with an LSTM or GRU to handle sequences of states
-  and appraisals: `emotion_t = f(state_t, hidden_state_{t-1})`.
+-- **Temporal / sequence modeling**  
+ Extend `NeuralAppraisal` with an LSTM or GRU to handle sequences of states
+and appraisals: \(emotion*t = f(state_t, hidden_state*{t-1})\).
 
 - **Joint RL + appraisal training**  
   Instead of pure imitation of the rule-based appraisals, combine RL

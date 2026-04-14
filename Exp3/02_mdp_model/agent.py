@@ -1,37 +1,34 @@
 import random
 from operator import itemgetter
 import csv
+import json
 import os
 import sys
+from datetime import datetime
+
+from appraisal_model import RuleBasedAppraisalModel, NeuralAppraisalModel
+
+# Flags are controlled primarily via environment variables so that different
+# experimental conditions can be launched without editing this file.
 
 # Flag to switch between rule-based and neural appraisal
-USE_NEURAL_APPRAISAL = False
+USE_NEURAL_APPRAISAL = os.getenv("USE_NEURAL_APPRAISAL", "0") == "1"
 
-# Flag to switch between original state-based reward and emotion-based reward
-USE_EMOTION_REWARD = False
+# Flag to switch between original state-based reward and emotion-aware reward shaping
+USE_EMOTION_REWARD = os.getenv("USE_EMOTION_REWARD", "0") == "1"
 
-# How to combine base (MDP) reward and emotion reward: "replace" or "mix"
-EMOTION_REWARD_MODE = "replace"
-
-# When EMOTION_REWARD_MODE == "mix":
-#   final_reward = BASE_WEIGHT * base_reward + (1-BASE_WEIGHT) * emotion_reward
-EMOTION_REWARD_BASE_WEIGHT = 0.5
-
-# Make sure we can import from the repository root (for models.neural_appraisal)
-_this_dir = os.path.dirname(__file__)
-_repo_root = os.path.dirname(os.path.dirname(_this_dir))
-if _repo_root not in sys.path:
-    sys.path.append(_repo_root)
-
+# Reward shaping strength: r' = r + LAMBDA * f(appraisal)
 try:
-    import torch
-    import torch.nn as nn
-    from models.neural_appraisal import NeuralAppraisal
-except ImportError:
-    torch = None
-    nn = None
-    NeuralAppraisal = None
+    EMOTION_REWARD_LAMBDA = float(os.getenv("EMOTION_REWARD_LAMBDA", "0.5"))
+except ValueError:
+    EMOTION_REWARD_LAMBDA = 0.5
 
+# Per-step logging of TD error, appraisal, Q-values, and action
+LOG_STEPS = os.getenv("LOG_STEPS", "0") == "1"
+
+_this_dir = os.path.dirname(__file__)
+_exp_dir = os.path.dirname(_this_dir)
+LOG_DIR = os.path.join(_exp_dir, "logs")
 
 class agent():
     def __init__(self,mdp):
@@ -53,8 +50,10 @@ class agent():
         self.power_app = 0.0
         self.last_neural_loss = None
         self.cumulative_reward = 0.0
+        self.step_index = 0
+        self._step_log_path = None
         #Q table is for every State Action pair.
-        
+
         # build state index for neural model input if permitted_states available
         if hasattr(self.mdp, "permitted_states"):
             self._state_list = list(self.mdp.permitted_states)
@@ -71,9 +70,36 @@ class agent():
                 for s2 in self.mdp.t.keys():
                     self.t_hat[s][a][s2]=0
 
-        # initialise neural appraisal model (optional)
-        self.neural_appraisal = None
-        self._init_neural_appraisal()
+        # initialise appraisal models
+        self.rule_appraisal_model = RuleBasedAppraisalModel(self)
+        self.neural_appraisal_model = None
+        if USE_NEURAL_APPRAISAL:
+            self.neural_appraisal_model = NeuralAppraisalModel(self)
+
+        # set up step-level logging
+        if LOG_STEPS:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            scenario = self.mdp.__class__.__name__
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self._step_log_path = os.path.join(
+                LOG_DIR,
+                f"{scenario}_steps_{timestamp}.csv",
+            )
+            with open(self._step_log_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "step",
+                    "state",
+                    "next_state",
+                    "action",
+                    "reward",
+                    "td_error",
+                    "suddenness",
+                    "goal_relevance",
+                    "conduciveness",
+                    "power",
+                    "q_values_json",
+                ])
     
 
     def update_q_learning(self):
@@ -148,84 +174,49 @@ class agent():
         )
         return reward
 
-    def _init_neural_appraisal(self):
-        """Initialise the neural appraisal model and optimiser if enabled.
-
-        Keeps the existing rule-based pipeline intact when disabled.
-        """
-        if not USE_NEURAL_APPRAISAL:
-            return
-        if NeuralAppraisal is None or torch is None:
-            print("Neural appraisal requested but PyTorch is not available.")
-            return
-
-        input_dim = len(self._state_list)
-        output_dim = 4  # [suddenness, goal_relevance, conduciveness, power]
-        self.neural_appraisal = NeuralAppraisal(input_dim, output_dim)
-        self._na_optimizer = torch.optim.Adam(self.neural_appraisal.parameters(), lr=1e-3)
-        self._na_loss_fn = nn.MSELoss()
-
-    def _encode_state_vector(self, state=None):
-        """Encode the current MDP state as a one-hot vector for the neural model."""
-        if torch is None:
-            return None
-        if state is None:
-            state = getattr(self.mdp, "chosen_state", None) or self.mdp.state
-        idx = self._state_to_idx.get(state, None)
-        if idx is None:
-            return None
-        x = torch.zeros(len(self._state_list), dtype=torch.float32)
-        x[idx] = 1.0
-        return x.unsqueeze(0)
-
-    def _compute_rule_based_emotion(self):
-        """Compute emotion using the original rule-based appraisal functions."""
-        sud = float(self.appraise_suddenness())
-        goal = float(self.appraise_goal_relevance())
-        cdc = float(self.appraise_conduciveness())
-        power = float(self.appraise_power())
-        # keep attributes for downstream code and logging
-        self.sud_app, self.goal_app, self.cdc_app, self.power_app = sud, goal, cdc, power
-        return [sud, goal, cdc, power]
-
     def compute_emotion(self, train_neural: bool = False, log_shapes: bool = False):
-        """Return the current emotion vector and optionally train the neural model.
+        """Return the current emotion/appraisal vector.
 
-        When USE_NEURAL_APPRAISAL is False, this falls back to the original
-        rule-based appraisal while still exposing a consistent interface.
+        - Always computes the rule-based appraisals via RuleBasedAppraisalModel.
+        - If USE_NEURAL_APPRAISAL is enabled and the neural model is
+          available, it produces a neural appraisal vector using learning-
+          aware features (TD error, reward, Q-values).
+        - The chosen vector is stored in self.sud_app, self.goal_app,
+          self.cdc_app, self.power_app and also returned.
         """
-        rule_emotion = self._compute_rule_based_emotion()
+        state = self.mdp.previous_state
+        action = self.mdp.previous_action
+        reward = getattr(self.mdp, "reward", 0.0)
+        next_state = self.mdp.state
 
-        if not USE_NEURAL_APPRAISAL or self.neural_appraisal is None:
-            # Only rule-based emotion is used.
-            return rule_emotion
+        rule_emotion = self.rule_appraisal_model.compute(
+            state=state,
+            action=action,
+            reward=reward,
+            next_state=next_state,
+        )
 
-        x = self._encode_state_vector()
-        if x is None:
-            # Fallback if encoding fails
-            return rule_emotion
+        # Default: use rule-based emotion
+        chosen = list(rule_emotion)
 
-        emo_pred = self.neural_appraisal(x)
+        # Optional neural appraisal
+        if USE_NEURAL_APPRAISAL and self.neural_appraisal_model is not None:
+            chosen = self.neural_appraisal_model.compute(
+                state=state,
+                action=action,
+                reward=reward,
+                next_state=next_state,
+                train=train_neural,
+                target=rule_emotion,
+            )
+
+        if len(chosen) == 4:
+            self.sud_app, self.goal_app, self.cdc_app, self.power_app = chosen
+
         if log_shapes:
-            print("[NeuralAppraisal] input shape:", tuple(x.shape), "output shape:", tuple(emo_pred.shape))
+            print("[Appraisal] vec:", [round(float(v), 4) for v in chosen])
 
-        # update attributes from neural output
-        emo_list = emo_pred.detach().cpu().view(-1).tolist()
-        if len(emo_list) == 4:
-            self.sud_app, self.goal_app, self.cdc_app, self.power_app = emo_list
-
-        if train_neural:
-            target = torch.tensor(rule_emotion, dtype=torch.float32).unsqueeze(0)
-            loss = self._na_loss_fn(emo_pred, target)
-            self._na_optimizer.zero_grad()
-            loss.backward()
-            self._na_optimizer.step()
-            self.last_neural_loss = float(loss.item())
-            print("[NeuralAppraisal] training loss:", round(self.last_neural_loss, 6))
-            print("[NeuralAppraisal] rule-based:", [round(v, 4) for v in rule_emotion])
-            print("[NeuralAppraisal] neural   :", [round(v, 4) for v in emo_list])
-
-        return emo_list
+        return chosen
 
     def choose_action_epsilon_greedy(self): 
         self.mdp.previous_action = self.mdp.action
@@ -256,28 +247,39 @@ class agent():
         self.mdp.calculate_reward()
         base_reward = self.mdp.reward
 
-        # Optionally replace or mix the reward with emotion-based reward
+        # Optional emotion-aware reward shaping: r' = r + lambda * f(appraisal)
         if USE_EMOTION_REWARD:
-            # Use the current appraisal as input to the reward function.
-            # We do not train the neural model here; this keeps the reward
-            # purely a function of the current emotion signal.
             emotion = self.compute_emotion(train_neural=False, log_shapes=False)
             emotion_reward = self._emotion_to_reward(emotion)
-
-            if EMOTION_REWARD_MODE == "replace":
-                self.mdp.reward = emotion_reward
-            elif EMOTION_REWARD_MODE == "mix":
-                self.mdp.reward = (
-                    EMOTION_REWARD_BASE_WEIGHT * base_reward +
-                    (1.0 - EMOTION_REWARD_BASE_WEIGHT) * emotion_reward
-                )
-            # Lightweight debugging print; comment out if too verbose.
-            # print("[Reward] base=", round(base_reward,3),
-            #       "emotion=", round(emotion_reward,3),
-            #       "final=", round(self.mdp.reward,3))
+            self.mdp.reward = base_reward + EMOTION_REWARD_LAMBDA * emotion_reward
 
         # Track cumulative reward for logging at the episode level
         self.cumulative_reward += self.mdp.reward
+
+        # Per-step logging (optional)
+        if LOG_STEPS and self._step_log_path is not None:
+            self.step_index += 1
+            # Ensure appraisal attributes are up to date for logging
+            emo_vec = self.compute_emotion(train_neural=False, log_shapes=False)
+            state = self.mdp.previous_state
+            next_state = self.mdp.state
+            action = self.mdp.previous_action
+            q_vals = self.q.get(next_state, {})
+            with open(self._step_log_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    self.step_index,
+                    state,
+                    next_state,
+                    action,
+                    self.mdp.reward,
+                    self.td_error,
+                    emo_vec[0] if len(emo_vec) > 0 else None,
+                    emo_vec[1] if len(emo_vec) > 1 else None,
+                    emo_vec[2] if len(emo_vec) > 2 else None,
+                    emo_vec[3] if len(emo_vec) > 3 else None,
+                    json.dumps(q_vals),
+                ])
 
         if self.mdp.terminal:
             self.update_q_td()
@@ -341,6 +343,9 @@ class agent():
         # reward having too much influence
         # state = self.mdp.state
         state = self.mdp.chosen_state
+        if state is None or state not in self.q:
+            self.power_app = 0.0
+            return self.power_app
         avg_q = sum(self.q[state].values())/len(self.q[state].values())
         min_q = min(self.q[state].values())
         max_q = max(self.q[state].values())
@@ -356,9 +361,14 @@ class agent():
 
     def appraise_suddenness(self):
         # It calculates p(s'|at-1)
-        s = sum(self.t_hat[self.mdp.previous_state][self.mdp.previous_action].values())
+        prev_state = self.mdp.previous_state
+        prev_action = self.mdp.previous_action
+        if prev_state not in self.t_hat or prev_action not in self.t_hat[prev_state]:
+            self.sud_app = 0
+            return self.sud_app
+        s = sum(self.t_hat[prev_state][prev_action].values())
         if s > 0:
-            self.sud_app = 1-self.t_hat[self.mdp.previous_state][self.mdp.previous_action][self.mdp.state]/s
+            self.sud_app = 1 - self.t_hat[prev_state][prev_action][self.mdp.state] / s
             # suddennes = 1- (frequency)
         else:
             self.sud_app = 0
