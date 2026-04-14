@@ -1,0 +1,2 @@
+step,state,next_state,action,reward,td_error,suddenness,goal_relevance,conduciveness,power,q_values_json
+1,S,S1,,-1.0,0,0.0,0.0,0.0,0.0,"{""frwd"": 0}"
