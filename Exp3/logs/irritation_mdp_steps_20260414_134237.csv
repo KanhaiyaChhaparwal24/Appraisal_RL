@@ -1,3 +1,0 @@
-step,state,next_state,action,reward,td_error,suddenness,goal_relevance,conduciveness,power,q_values_json
-1,S,S1,,-1,0,0.0,0.0,0.0,0.0,"{""frwd"": 0}"
-2,S1,P,frwd,-10,-0.3,0.0,0.3,0.35,0.0,"{""a1"": 0, ""a2"": 0}"
